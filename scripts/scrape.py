@@ -5,7 +5,6 @@ Also updates public/data/manifest.json so the dashboard knows what's available.
 """
 
 import json
-import os
 import re
 import time
 from pathlib import Path
@@ -18,12 +17,11 @@ RBI_INDEX_URL = "https://www.rbi.org.in/Scripts/ATMView.aspx"
 DATA_DIR      = Path(__file__).parent.parent / "public" / "data"
 MANIFEST_FILE = DATA_DIR / "manifest.json"
 HEADERS       = {
-    "User-Agent": (
-        "Mozilla/5.0 (compatible; rbi-dashboard-bot/1.0; "
-        "+https://github.com/YOUR_USERNAME/rbi-dashboard)"
-    )
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Referer":    "https://www.rbi.org.in/Scripts/ATMView.aspx",
+    "Accept":     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*",
 }
-SLEEP_BETWEEN = 2   # seconds between downloads — be polite to RBI's servers
+SLEEP_BETWEEN = 2
 
 # ── Month detection ───────────────────────────────────────────────────────────
 MONTH_NAMES = [
@@ -35,7 +33,7 @@ def detect_month_label(url: str, link_text: str) -> str | None:
     src = (url + " " + link_text).lower()
     year_match = re.search(r"20\d\d", src)
     year = year_match.group() if year_match else None
-    # Try "ATM122025" style (month number before year)
+    # Handle "ATM122025..." style filenames (numeric month before year)
     num_match = re.search(r'atm(\d{2})20\d\d', src)
     if num_match:
         month_num = int(num_match.group(1))
@@ -46,7 +44,7 @@ def detect_month_label(url: str, link_text: str) -> str | None:
             return f"{m.capitalize()} {year}" if year else m.capitalize()
     return None
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def load_manifest() -> dict:
     if MANIFEST_FILE.exists():
         return json.loads(MANIFEST_FILE.read_text())
@@ -56,10 +54,23 @@ def save_manifest(manifest: dict):
     MANIFEST_FILE.write_text(json.dumps(manifest, indent=2))
     print(f"  ✓ Manifest updated ({len(manifest['files'])} files)")
 
+def is_valid_xlsx(content: bytes) -> bool:
+    # XLSX files are ZIP archives — they start with PK magic bytes
+    return content[:2] == b'PK'
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 def scrape():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest()
     existing_urls = {f["url"] for f in manifest["files"]}
+
+    # Also delete any previously saved bad files (HTML saved as XLSX)
+    for f in manifest["files"]:
+        dest = DATA_DIR / f["filename"]
+        if dest.exists() and not is_valid_xlsx(dest.read_bytes()):
+            print(f"  removing bad file: {f['filename'][:50]}")
+            dest.unlink()
+            existing_urls.discard(f["url"])
 
     print(f"Fetching RBI index: {RBI_INDEX_URL}")
     resp = requests.get(RBI_INDEX_URL, headers=HEADERS, timeout=30)
@@ -67,12 +78,10 @@ def scrape():
 
     soup = BeautifulSoup(resp.text, "lxml")
 
-    # Find all .XLSX links
     xlsx_links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if href.upper().endswith(".XLSX") and "rbidocs.rbi.org.in" in href:
-            # Only include "Document" links (not PDF links)
             if "/ATM/DOCs/" in href:
                 xlsx_links.append((href, a.get_text(strip=True)))
 
@@ -92,6 +101,12 @@ def scrape():
         try:
             r = requests.get(url, headers=HEADERS, timeout=60)
             r.raise_for_status()
+
+            # Validate it's actually an Excel file, not an HTML error page
+            if not is_valid_xlsx(r.content):
+                print(f"  ✗ skipped (got HTML instead of Excel, RBI may be blocking): {filename[:40]}")
+                continue
+
             dest.write_bytes(r.content)
             new_files.append({
                 "url":      url,
@@ -99,16 +114,25 @@ def scrape():
                 "month":    month_label,
                 "size":     len(r.content),
             })
+            print(f"  ✓ saved ({len(r.content):,} bytes)")
             time.sleep(SLEEP_BETWEEN)
         except Exception as e:
             print(f"  ✗ failed: {e}")
 
+    # Remove bad entries from manifest (files that failed validation)
+    manifest["files"] = [
+        f for f in manifest["files"]
+        if (DATA_DIR / f["filename"]).exists() and is_valid_xlsx((DATA_DIR / f["filename"]).read_bytes())
+    ]
+
     if new_files:
         manifest["files"].extend(new_files)
-        # Sort by month (newest first for convenience)
-        manifest["files"].sort(key=lambda f: f.get("month") or "", reverse=True)
-        save_manifest(manifest)
-        print(f"\n✓ Downloaded {len(new_files)} new file(s)")
+
+    manifest["files"].sort(key=lambda f: f.get("month") or "", reverse=True)
+    save_manifest(manifest)
+
+    if new_files:
+        print(f"\n✓ Downloaded {len(new_files)} new valid file(s)")
     else:
         print("\n✓ No new files — manifest unchanged")
 
