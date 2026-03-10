@@ -32,10 +32,15 @@ MONTH_NAMES = [
 ]
 
 def detect_month_label(url: str, link_text: str) -> str | None:
-    """Try to extract 'Month YYYY' from a URL or link text."""
     src = (url + " " + link_text).lower()
     year_match = re.search(r"20\d\d", src)
     year = year_match.group() if year_match else None
+    # Try "ATM122025" style (month number before year)
+    num_match = re.search(r'atm(\d{2})20\d\d', src)
+    if num_match:
+        month_num = int(num_match.group(1))
+        if 1 <= month_num <= 12:
+            return f"{MONTH_NAMES[month_num-1].capitalize()} {year}"
     for m in MONTH_NAMES:
         if m in src:
             return f"{m.capitalize()} {year}" if year else m.capitalize()
@@ -101,7 +106,7 @@ def scrape():
     if new_files:
         manifest["files"].extend(new_files)
         # Sort by month (newest first for convenience)
-        manifest["files"].sort(key=lambda f: f.get("month", ""), reverse=True)
+        manifest["files"].sort(key=lambda f: f.get("month") or "", reverse=True)
         save_manifest(manifest)
         print(f"\n✓ Downloaded {len(new_files)} new file(s)")
     else:
